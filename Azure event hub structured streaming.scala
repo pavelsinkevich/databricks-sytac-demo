@@ -11,21 +11,20 @@ val connectionString = ConnectionStringBuilder(EH_CONN_STR)
 val eventHubsConf = EventHubsConf(connectionString)
  // .setStartingPosition(EventPosition.fromEndOfStream)
   
-val eventhubs = spark.readStream
+val eventhubs_df = spark.readStream
   .format("eventhubs")
   .options(eventHubsConf.toMap)
   .load()
 
 // COMMAND ----------
 
-display(eventhubs)
+display(eventhubs_df)
 
 // COMMAND ----------
 
-// split lines by whitespaces and explode the array as rows of 'word'
-val df = eventhubs.select($"body".cast("string"))
+val json_df = eventhubs_df.select($"body".cast("string"))
 
-display(df)
+display(json_df)
 
 // COMMAND ----------
 
@@ -56,10 +55,10 @@ val schema = new StructType()
   .add("totalAmount", DoubleType, true)
 
 // Parse JSON and create new columns
-val dfWithParsedJson = df.withColumn("parsed_body", from_json(col("body"), schema))
+val parsed_json_df = json_df.withColumn("parsed_body", from_json(col("body"), schema))
 
 // Select individual fields from parsed JSON
-val finalDf = dfWithParsedJson.select(
+val bronze_Df = parsed_json_df.select(
   col("parsed_body.vendorID").alias("vendorID"),
   col("parsed_body.tpepPickupDateTime").alias("tpepPickupDateTime"),
   col("parsed_body.tpepDropoffDateTime").alias("tpepDropoffDateTime"),
@@ -83,12 +82,68 @@ val finalDf = dfWithParsedJson.select(
   col("parsed_body.totalAmount").alias("totalAmount")
 )
 
-display(finalDf)
+display(bronze_Df)
 
 // COMMAND ----------
 
-finalDf.writeStream
+bronze_Df.writeStream
   .outputMode("append")
   .format("delta") // Use appropriate format for your table, e.g., "hive" for Hive tables
-  .option("checkpointLocation", "abfss://checkpoint@sytacdemo.dfs.core.windows.net/") // Checkpoint directory for fault tolerance
+  .option("checkpointLocation", "abfss://checkpoint@sytacdemo.dfs.core.windows.net/bronze") // Checkpoint directory for fault tolerance
   .toTable("streaming_bronze.Taxi")
+
+// COMMAND ----------
+
+// MAGIC %python
+// MAGIC from pyspark.sql.functions import col, current_timestamp, from_json, cast, lit, from_unixtime, to_timestamp, sum, avg, when, count, round, max
+// MAGIC from pyspark.sql.types import StructField, StructType, IntegerType, StringType, DoubleType, LongType, TimestampType
+// MAGIC
+// MAGIC python_bronze_df = spark.readStream.format("delta")\
+// MAGIC   .option("ignoreDeletes", "true")\
+// MAGIC   .table("streaming_bronze.Taxi")\
+// MAGIC   .withColumn("vendor_ID",col("vendorID"))\
+// MAGIC   .withColumn("pickup_Datetime", to_timestamp(from_unixtime(col("tpepPickupDateTime")/1000)))\
+// MAGIC   .withColumn("dropoff_Datetime", to_timestamp(from_unixtime(col("tpepDropoffDateTime")/1000)))\
+// MAGIC   .withColumn("passenger_Count", col("passengerCount"))\
+// MAGIC   .withColumn("trip_Distance", col("tripDistance"))\
+// MAGIC   .withColumn("fair_Amount", col("fareAmount"))\
+// MAGIC   .withColumn("total_Amount_Incl_Tax_Tip_Tolls", col("totalAmount"))\
+// MAGIC   .withColumn("ingestion_Date", current_timestamp())\
+// MAGIC   .drop("vendorID","tpepPickupDateTime","tpepDropoffDateTime","passengerCount","tripDistance","fareAmount","totalAmount")
+// MAGIC   
+// MAGIC display(python_bronze_df)
+// MAGIC
+
+// COMMAND ----------
+
+// MAGIC %python
+// MAGIC (python_bronze_df.writeStream
+// MAGIC   .format("delta")
+// MAGIC   .outputMode("append")
+// MAGIC   .option("checkpointLocation", "abfss://checkpoint@sytacdemo.dfs.core.windows.net/silver/")
+// MAGIC   .toTable("streaming_silver.Taxi")
+// MAGIC )
+
+// COMMAND ----------
+
+// MAGIC %python
+// MAGIC gold_df = spark.readStream.format("delta") \
+// MAGIC   .option("ignoreDeletes", "true") \
+// MAGIC   .table("streaming_silver.Taxi") \
+// MAGIC   .groupBy("vendor_id") \
+// MAGIC   .agg(round(sum("total_Amount_Incl_Tax_Tip_Tolls"), 2).alias("Total_amount_per_vendor"), 
+// MAGIC        round(sum("trip_Distance"), 2).alias("Total_trip_distance"), 
+// MAGIC        sum("passenger_Count").cast('Int').alias("Total_passengers"), 
+// MAGIC        max("ingestion_Date").alias("ingestion_Date"))
+// MAGIC
+// MAGIC display(gold_df)
+
+// COMMAND ----------
+
+// MAGIC %python
+// MAGIC (gold_df.writeStream
+// MAGIC   .format("delta")
+// MAGIC   .outputMode("complete")
+// MAGIC   .option("checkpointLocation", "abfss://checkpoint@sytacdemo.dfs.core.windows.net/gold/")
+// MAGIC   .toTable("streaming_gold.Taxi")
+// MAGIC )
